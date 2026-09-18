@@ -2,6 +2,36 @@
 
 A small DQN agent for the bomberman_rl framework.
 
+## Architecture update: local spatial patch (119-dim features)
+The original 19-dim feature vector only tracks the *single nearest*
+coin/crate/opponent by direction -- it has no way to represent "two
+opponents converging from different sides" or "this route is a dead
+end" in the network's own learned value function (only the hard-coded
+BFS shield could reason about that). Added a 5x5 local patch centered
+on the agent, 4 channels (walkable, danger urgency, coin present,
+opponent present) = 100 more features, for 119 total. Same MLP
+architecture otherwise (just a bigger input layer) -- still trivially
+fast on CPU, no think-time risk.
+
+**Tested properly before adopting**: same training regime (1500 rounds,
+direct on classic vs 3x rule_based_agent), same 3-seed evaluation
+protocol used throughout this project. Real, replicated improvement:
+score/round 1.13 -> 1.45 (~28%), avg survival 193 -> 212 steps, both
+with healthy invalid-action rates (under 1.2%, nowhere near the 11-12%
+that flagged real regressions earlier in development). Suicide rate
+ticked up slightly (0.647 -> 0.677) -- not a clean win on every single
+axis, but a real net improvement, unlike the opponent-threat-feature
+experiment which showed no signal at all under the same test rigor.
+
+**This requires training from scratch** -- a 119-dim input is not
+compatible with any checkpoint trained under the old 19-dim feature
+vector. Run `python dqn_train_pipeline.py --fresh` to get the full
+benefit through the complete curriculum (this test only used 1500
+rounds directly on the hardest scenario; the full pipeline should do
+better still). Back up whatever checkpoint you currently have before
+starting, exactly as before -- if the full curriculum somehow performs
+worse than this quick test suggested, you want a fallback.
+
 ## ⚠️ Compliance with the course's ML-only rule -- read before submitting
 The project spec states: *"Your solution must involve machine learning or
 it will be rejected"* and explicitly disallows *"a feature that
