@@ -67,9 +67,13 @@ def evaluate_once(n_rounds, scenario, opponents, seed):
 
 
 def evaluate(n_rounds, scenario, opponents=(), seeds=EVAL_SEEDS):
-    """Averages score (and reports suicide rate / avg survival) across
-    multiple seeds. Returns just the mean score for the keep/discard
-    decision, but prints the fuller picture so you have it for the report."""
+    """Averages score AND suicide rate across multiple seeds. Both are
+    returned now -- previously only score was used for the keep/discard
+    decision, which let a burst that spiked suicide rate while scoring a
+    few lucky points slip through as "kept" (exactly what happened with
+    the new-architecture Task 1 burst: score 41->92 looked like a win,
+    but suicide rate went 0.0->0.867 in the same burst -- pure luck from
+    grabbing coins fast before dying, not a real improvement)."""
     total_score, total_suicides, total_steps, total_rounds = 0, 0, 0, 0
     for seed in seeds:
         sc, su, st, r = evaluate_once(n_rounds, scenario, opponents, seed)
@@ -78,11 +82,12 @@ def evaluate(n_rounds, scenario, opponents=(), seeds=EVAL_SEEDS):
         total_steps += st
         total_rounds += r
     mean_score = total_score / len(seeds)
+    suicide_rate = total_suicides / total_rounds
     print(f"    avg score={mean_score:.1f}  "
-          f"suicide_rate={total_suicides / total_rounds:.3f}/round  "
+          f"suicide_rate={suicide_rate:.3f}/round  "
           f"avg_steps={total_steps / total_rounds:.1f}  "
           f"(over {len(seeds)} seeds x {n_rounds} rounds)")
-    return mean_score
+    return mean_score, suicide_rate
 
 
 def backup_best():
@@ -103,19 +108,27 @@ def restore_best():
 
 def stage(name, train_rounds, epsilon, scenario, opponents=(), eval_rounds=30, best_scores=None):
     """best_scores: dict shared across all stage() calls in this run, keyed
-    by (scenario, opponents), tracking the best score ever seen for that
-    exact task configuration. Comparing against this (rather than against
-    the immediately preceding stage's own score) prevents compounding drift:
-    a 15% tolerance applied stage-to-stage, chained across ~10 stages, can
-    lose the majority of real progress even though each individual step
-    looked fine -- 0.85^10 ≈ 0.20, an 80% possible cumulative loss. Anchoring
-    to the per-config best-ever closes that gap. Different scenarios/
-    opponents aren't comparable in raw score, hence keying by config rather
-    than tracking one single global best."""
+    by (scenario, opponents), tracking (score, suicide_rate) for the best
+    result ever seen for that exact task configuration. Comparing against
+    this (rather than against the immediately preceding stage's own score)
+    prevents compounding drift: a 15% tolerance applied stage-to-stage,
+    chained across ~10 stages, can lose the majority of real progress even
+    though each individual step looked fine -- 0.85^10 ≈ 0.20, an 80%
+    possible cumulative loss. Anchoring to the per-config best-ever closes
+    that gap. Different scenarios/opponents aren't comparable in raw score,
+    hence keying by config rather than tracking one single global best.
+
+    Gating checks BOTH score and suicide rate. Score-only gating let a
+    burst that spiked suicide rate while getting lucky on score slip
+    through as "kept" (score 41->92 while suicide rate went 0.0->0.867 in
+    one real run) -- a burst is only kept if score didn't drop too much
+    AND suicide rate didn't rise more than a fixed absolute amount.
+    """
     if best_scores is None:
         best_scores = {}
     key = (scenario, opponents)
     eval_seeds = EVAL_SEEDS_VS_OPPONENTS if opponents else EVAL_SEEDS
+    SUICIDE_RATE_TOLERANCE = 0.15  # max allowed absolute increase over baseline
 
     print(f"\n=== {name} ===")
     print(f"    train: --agents {AGENT_NAME} {' '.join(opponents)} "
@@ -125,12 +138,13 @@ def stage(name, train_rounds, epsilon, scenario, opponents=(), eval_rounds=30, b
         backup_best()
 
     if key in best_scores:
-        baseline = best_scores[key]
-        print(f"  baseline (best-ever for this config): {baseline:.1f}")
+        baseline, baseline_suicide = best_scores[key]
+        print(f"  baseline (best-ever for this config): score={baseline:.1f}  "
+              f"suicide_rate={baseline_suicide:.3f}")
     else:
         print("  baseline:")
-        baseline = evaluate(eval_rounds, scenario, opponents, seeds=eval_seeds)
-        best_scores[key] = baseline
+        baseline, baseline_suicide = evaluate(eval_rounds, scenario, opponents, seeds=eval_seeds)
+        best_scores[key] = (baseline, baseline_suicide)
 
     set_epsilon(epsilon)
     cmd = [sys.executable, "main.py", "play", "--agents", AGENT_NAME, *opponents,
@@ -138,18 +152,28 @@ def stage(name, train_rounds, epsilon, scenario, opponents=(), eval_rounds=30, b
     run(cmd)
 
     print("  after training:")
-    new_score = evaluate(eval_rounds, scenario, opponents, seeds=eval_seeds)
+    new_score, new_suicide = evaluate(eval_rounds, scenario, opponents, seeds=eval_seeds)
 
-    if new_score >= baseline * 0.85:  # small tolerance -- noisy evals (esp.
-        # rule_based_agent's own randomness isn't covered by --seed) can
-        # make a genuinely-fine burst look slightly worse by chance; a
-        # strict >= caused 8 consecutive false-regression reverts in
-        # testing, permanently stalling progress after Task 2.
+    score_ok = new_score >= baseline * 0.85  # small tolerance -- noisy evals (esp.
+    # rule_based_agent's own randomness isn't covered by --seed) can make a
+    # genuinely-fine burst look slightly worse by chance; a strict >= caused
+    # 8 consecutive false-regression reverts in testing, permanently
+    # stalling progress after Task 2.
+    suicide_ok = new_suicide <= baseline_suicide + SUICIDE_RATE_TOLERANCE
+
+    if score_ok and suicide_ok:
         print("  -> kept (improved, held steady, or within noise tolerance)")
         backup_best()
-        best_scores[key] = max(best_scores[key], new_score)
+        if new_score > best_scores[key][0]:
+            best_scores[key] = (new_score, new_suicide)
     else:
-        print("  -> DISCARDED (regressed), reverted to previous best")
+        reason = []
+        if not score_ok:
+            reason.append(f"score dropped too much ({new_score:.1f} vs baseline {baseline:.1f})")
+        if not suicide_ok:
+            reason.append(f"suicide rate rose too much ({new_suicide:.3f} vs baseline "
+                           f"{baseline_suicide:.3f}, allowed +{SUICIDE_RATE_TOLERANCE})")
+        print(f"  -> DISCARDED ({'; '.join(reason)}), reverted to previous best")
         restore_best()
 
     return best_scores
@@ -168,18 +192,19 @@ if __name__ == "__main__":
     scores = {}  # shared across all stages: tracks best-ever score per (scenario, opponents) config
 
     # --- Task 1: solo coin collection, no crates, no opponents ---
-    # "The agent should learn how to navigate the board efficiently."
-    stage("Task 1: solo coin collection", 800, 1.0, "coin-heaven", best_scores=scores)
-    stage("Task 1: solo coin collection (burst 2)", 800, 0.4, "coin-heaven", best_scores=scores)
+    # More rounds to build a stronger coin-seeking baseline -- the
+    # coin-approach reward (+0.15/step) now needs to overcome more noise.
+    stage("Task 1: solo coin collection", 1200, 1.0, "coin-heaven", best_scores=scores)
+    stage("Task 1: solo coin collection (burst 2)", 1200, 0.4, "coin-heaven", best_scores=scores)
+    stage("Task 1: solo coin collection (burst 3)", 800, 0.2, "coin-heaven", best_scores=scores)
 
     # --- Task 2: solo crate-bombing + escaping, no opponents ---
-    # "It should learn how to use bombs without killing itself ... place
-    # proper emphasis on this step." loot-crate has the same crate density
-    # as classic but denser coins for a faster reward signal; classic-solo
-    # (the spec's literal example command) is used as a periodic sanity
-    # check since it's the actual tournament density/coin-count.
-    stage("Task 2: solo bombing (loot-crate, burst 1)", 1000, 0.5, "loot-crate", best_scores=scores)
-    stage("Task 2: solo bombing (loot-crate, burst 2)", 1000, 0.25, "loot-crate", best_scores=scores)
+    # Extra loot-crate bursts to address "waiting for others to break
+    # crates" -- this is the scenario where that failure mode appears.
+    # The new all_blocked feature + BOMB_DROPPED bonus should help here.
+    stage("Task 2: solo bombing (loot-crate, burst 1)", 1500, 0.5, "loot-crate", best_scores=scores)
+    stage("Task 2: solo bombing (loot-crate, burst 2)", 1500, 0.25, "loot-crate", best_scores=scores)
+    stage("Task 2: solo bombing (loot-crate, burst 3)", 1000, 0.15, "loot-crate", best_scores=scores)
     stage("Task 2: solo bombing (classic sanity check)", 800, 0.15, "classic", best_scores=scores)
 
     # --- Task 3: hunt weak opponents ---
@@ -203,5 +228,5 @@ if __name__ == "__main__":
               opponents=("rule_based_agent", "rule_based_agent", "rule_based_agent"), best_scores=scores)
 
     print("\n=== PIPELINE DONE. Final check: tournament configuration, 5 seeds x 100 rounds ===")
-    final = evaluate(100, "classic", opponents=("rule_based_agent",) * 3, seeds=(1, 2, 3, 4, 5))
-    print(f"final avg score vs 3x rule_based_agent: {final:.1f}")
+    final_score, final_suicide = evaluate(100, "classic", opponents=("rule_based_agent",) * 3, seeds=(1, 2, 3, 4, 5))
+    print(f"final avg score vs 3x rule_based_agent: {final_score:.1f}  (suicide_rate={final_suicide:.3f})")
