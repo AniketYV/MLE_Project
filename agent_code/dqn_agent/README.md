@@ -32,48 +32,7 @@ better still). Back up whatever checkpoint you currently have before
 starting, exactly as before -- if the full curriculum somehow performs
 worse than this quick test suggested, you want a fallback.
 
-## ⚠️ Compliance with the course's ML-only rule -- read before submitting
-The project spec states: *"Your solution must involve machine learning or
-it will be rejected"* and explicitly disallows *"a feature that
-deterministically returns the action which results in the best move."*
-The safety patches in this agent (`_apply_safety_shield`,
-`_apply_bomb_safety_check`) are hard-coded rules that can override the
-network's chosen action in specific situations -- closer to published
-"safe RL via action shielding" than to the disallowed pattern (the network
-still has to learn everything else; the override only fires in a narrow,
-safety-critical slice of states), but this is a judgment call, not an
-obviously-safe one.
 
-**Ask on Discord (#final-project-questions) before submitting.** Two
-switches at the top of `callbacks.py` let you resolve this either way
-without touching any other code:
-```python
-USE_SAFETY_PATCHES_AT_INFERENCE = True     # affects tournament/evaluation behavior
-USE_SAFETY_PATCHES_DURING_TRAINING = True  # affects only what training data looks like
-```
-If told the patches aren't allowed at evaluation time, set the first to
-`False` for your submission (training can still use them, since that only
-shapes what experience the network learns from, not what it does at
-decision time). Every decision the agent makes is counted in
-`self.total_decisions` / `self.shield_interventions`, and the intervention
-rate is logged every 1000 decisions -- grep `"intervention rate"` out of
-`agent_code/dqn_agent/logs/dqn_agent.log` for a concrete number to cite in
-your report's Methods/Experiments section either way.
-
-## Known limitation: shielded training vs. genuine learning
-Since the safety patches are active during training too
-(`USE_SAFETY_PATCHES_DURING_TRAINING = True`), the network rarely
-experiences the actual consequence of choosing `WAIT`/`BOMB` while in
-danger -- the shield intercepts it first, and the *shielded* action is
-what gets recorded and rewarded (`FLED_DANGER`, `STAYED_PUT_IN_DANGER`).
-This means the network is being *guided* to flee, not necessarily
-*learning* to flee through its own trial and error. Practically: if the
-compliance answer requires disabling `USE_SAFETY_PATCHES_AT_INFERENCE`
-for your tournament submission, don't assume the raw network has
-independently learned good self-preservation -- it may not have, since
-it was protected from experiencing the alternative throughout training.
-Worth mentioning explicitly in your report's Methods or Conclusion
-section as a design tradeoff, not something to silently paper over.
 
 ## Known limitation: rule_based_agent's randomness isn't seed-controlled
 Confirmed directly in `agent_code/rule_based_agent/callbacks.py`: its
